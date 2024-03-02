@@ -1,0 +1,194 @@
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/imu.hpp"
+#include "sensor_msgs/msg/magnetic_field.hpp"
+#include "tf2_ros/transform_broadcaster.h"
+#include "geometry_msgs/msg/transform_stamped.hpp"
+
+#include <iostream>
+#include <boost/asio.hpp>
+#include <boost/bind.hpp>
+#include <string>
+
+
+using namespace std;
+
+#define MAX_PACKET_LEN (58) // length of the data
+
+typedef enum
+{
+    kItemID = 0x90,            /* user programed ID    size: 1 */
+    kItemAccRaw = 0xA0,        /* raw acc              size: 3x2 */
+    kItemGyoRaw = 0xB0,        /* raw gyro             size: 3x2 */
+    kItemMagRaw = 0xC0,        /* raw mag              size: 3x2 */
+    kItemAtdE = 0xD0,          /* eular angle          size:3x2 */
+    kItemAtdQ = 0xD1,          /* att q,               size:4x4 */
+    kItemPressure = 0xF0,      /* pressure             size:1x4 */
+} ItemID_t;
+
+class ImuNode : public rclcpp::Node
+{
+public:
+    ImuNode() : Node("imu_read_node"), sp(iosev, com_port)
+    {
+        // Initialize parameters
+        declare_parameter("com_port", "/dev/imu");
+        declare_parameter("imu_frame_id", "imu_link");
+        declare_parameter("mag_frame_id", "imu_link");
+        declare_parameter("imu_topic", "/imu");
+        declare_parameter("mag_topic", "/mag");
+
+        get_parameter("com_port", com_port);
+        get_parameter("imu_frame_id", imu_frame_id);
+        get_parameter("mag_frame_id", mag_frame_id);
+        get_parameter("imu_topic", imu_topic);
+        get_parameter("mag_topic", mag_topic);
+
+        imu_pub = create_publisher<sensor_msgs::msg::Imu>(imu_topic, 1000);
+        mag_pub = create_publisher<sensor_msgs::msg::MagneticField>(mag_topic, 1000);
+        tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+
+        // Initialize serial port
+        sp.set_option(boost::asio::serial_port::baud_rate(460800));
+        sp.set_option(boost::asio::serial_port::flow_control(boost::asio::serial_port::flow_control::none));
+        sp.set_option(boost::asio::serial_port::parity(boost::asio::serial_port::parity::none));
+        sp.set_option(boost::asio::serial_port::stop_bits(boost::asio::serial_port::stop_bits::one));
+        sp.set_option(boost::asio::serial_port::character_size(8));
+
+        count = 0;
+
+        // Start reading IMU data
+        RCLCPP_INFO(get_logger(), "Start reading IMU data from %s", com_port.c_str());
+        timer = create_wall_timer(std::chrono::milliseconds(100), std::bind(&ImuNode::readIMU, this));
+    }
+
+    ~ImuNode()
+    {
+        // Shutdown
+        RCLCPP_INFO(get_logger(), "Exit reading IMU data from %s", com_port.c_str());
+        iosev.run();
+    }
+
+private:
+
+    void readIMU()
+    {
+
+        uint8_t buf_tmp[1];
+        uint8_t buf[MAX_PACKET_LEN - 1];
+        read(sp, boost::asio::buffer(buf_tmp));
+        if (buf_tmp[0] == 0x5A)
+        {
+            read(sp, boost::asio::buffer(buf));
+
+            auto imu_msg = std::make_unique<sensor_msgs::msg::Imu>();
+            imu_msg->header.stamp = get_clock()->now();
+            imu_msg->header.frame_id = imu_frame_id;
+
+            auto mag_msg = std::make_unique<sensor_msgs::msg::MagneticField>();
+            mag_msg->header.stamp = get_clock()->now();
+            mag_msg->header.frame_id = mag_frame_id;
+
+            int i = 0;
+            if (buf[i] == 0xA5) /* user ID */
+            {
+                i += 5;
+
+                if (buf[i + 0] == kItemID) // user ID
+                {
+                    ID = buf[i + 1];
+                }
+                if (buf[i + 2] == kItemAccRaw) // Acc value
+                {
+                    memcpy(AccRaw, &buf[i + 3], 6);
+                    imu_msg->linear_acceleration.x = AccRaw[0] / 1000.0 * 9.7887;
+                    imu_msg->linear_acceleration.y = AccRaw[1] / 1000.0 * 9.7887;
+                    imu_msg->linear_acceleration.z = AccRaw[2] / 1000.0 * 9.7887;
+                }
+                if (buf[i + 9] == kItemGyoRaw) // Gyro value
+                {
+                    memcpy(GyoRaw, &buf[i + 10], 6);
+                    imu_msg->angular_velocity.x = GyoRaw[0] * M_PI / 10.0 / 180.0;
+                    imu_msg->angular_velocity.y = GyoRaw[1] * M_PI / 10.0 / 180.0;
+                    imu_msg->angular_velocity.z = GyoRaw[2] * M_PI / 10.0 / 180.0;
+                }
+                if (buf[i + 16] == kItemMagRaw) // Mag value
+                {
+                    memcpy(MagRaw, &buf[i + 17], 6);
+                    mag_msg->magnetic_field.x = MagRaw[0] / 1000.0 / 10000.0;
+                    mag_msg->magnetic_field.y = MagRaw[1] / 1000.0 / 10000.0;
+                    mag_msg->magnetic_field.z = MagRaw[2] / 1000.0 / 10000.0;
+                }
+                if (buf[i + 23] == kItemAtdE) // atd E
+                {
+                    Eular[0] = ((float)(int16_t)(buf[i + 24] + (buf[i + 25] << 8))) / 100;
+                    Eular[1] = ((float)(int16_t)(buf[i + 26] + (buf[i + 27] << 8))) / 100;
+                    Eular[2] = ((float)(int16_t)(buf[i + 28] + (buf[i + 29] << 8))) / 10;
+                    pith = Eular[0];
+                    roll = Eular[1];
+                    yaw = Eular[2];
+                    // std::cout << Eular[2] << std::endl;
+                    // geometry_msgs::Quaternion quat = tf::createQuaternionMsgFromRollPitchYaw(roll, pith, yaw);
+                    // imu_msg.orientation = quat;
+                    // imu_msg.linear_acceleration_covariance=boost::array<double, 9>;
+                }
+                if (buf[i + 30] == kItemAtdQ) // atd Q
+                {
+                    memcpy(quat, &buf[i + 31], 16);
+                    imu_msg->orientation.x = quat[1];
+                    imu_msg->orientation.y = quat[2];
+                    imu_msg->orientation.z = quat[3];
+                    imu_msg->orientation.w = quat[0];
+                    std::cout << quat[1] << std::endl;
+                }
+
+                imu_pub->publish(std::move(imu_msg));
+                mag_pub->publish(std::move(mag_msg));
+
+                // Broadcast TF
+                geometry_msgs::msg::TransformStamped transformStamped;
+                transformStamped.header.stamp = now();
+                transformStamped.header.frame_id = "world";
+                transformStamped.child_frame_id = imu_frame_id;
+                transformStamped.transform.translation.x = 0.0;
+                transformStamped.transform.translation.y = 0.0;
+                transformStamped.transform.translation.z = 0.0;
+                transformStamped.transform.rotation = imu_msg->orientation;
+                tf_broadcaster->sendTransform(transformStamped);
+
+                count++;
+            }
+        }
+    }
+
+
+    int count;
+    uint8_t ID;
+    uint8_t AccRaw[3];
+    uint8_t GyoRaw[3];
+    uint8_t MagRaw[3];
+    float Eular[3];
+    float pith, roll, yaw;
+    float quat[4];
+    string com_port = "/dev/imu";
+    string imu_frame_id;
+    string mag_frame_id;
+    string imu_topic;
+    string mag_topic;
+
+    rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub;
+    rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr mag_pub;
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster;
+
+    boost::asio::io_service iosev;
+    boost::asio::serial_port sp;
+    rclcpp::TimerBase::SharedPtr timer;
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<ImuNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}
